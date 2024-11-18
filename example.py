@@ -1,105 +1,99 @@
 import os
-from typing import List, Dict, Optional
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Set tokenizers parallelism before importing/using tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-class TinyLlama:
-    def __init__(
-        self,
-        model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        device: Optional[str] = None
-    ):
-        """
-        Initialize TinyLlama model and tokenizer.
-        
-        Args:
-            model_name: HuggingFace model name/path
-            device: Device to place model on ('cuda', 'cpu', etc). If None, auto-detect.
-        """
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Load tokenizer and model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device
-        )
-        
-    def generate(
-        self,
-        messages: List[Dict[str, str]],
-        max_new_tokens: int = 256,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.95,
-    ) -> str:
-        """
-        Generate a response given a list of messages.
-        
-        Args:
-            messages: List of message dictionaries with 'role' and 'content'
-            max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            top_p: Top-p sampling parameter
-            
-        Returns:
-            str: Generated response
-        """
-        # Format prompt using chat template
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        # Tokenize input
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = inputs.to(self.device)
-        
-        # Generate response
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        
-        # Decode and return the generated text
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return response
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from model import TinyLlama
 
-def main() -> None:
-    """Main function to demonstrate TinyLlama chat capabilities."""
-    # Initialize model
-    model = TinyLlama()
+def load_model_and_tokenizer():
+    # First load the HF model and tokenizer
+    hf_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    hf_tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
+    hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name)
+    print(hf_model.model)
+    # Create our custom model with same config
+    config = hf_model.config
+    model = TinyLlama(
+        vocab_size=config.vocab_size,
+        dim=config.hidden_size,
+        n_layers=config.num_hidden_layers,
+        n_heads=config.num_attention_heads,
+        intermediate_size=config.intermediate_size,
+        hidden_act=config.hidden_act,
+        num_key_value_heads=config.num_key_value_heads
+    )
     
-    # Example conversation
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful AI assistant who provides clear and concise answers."
-        },
-        {
-            "role": "user",
-            "content": "What is the capital of France and what is it famous for?"
-        }
-    ]
+    # Copy weights from HF model to our model
+    def copy_weights(m1, m2):
+        with torch.no_grad():
+            if m1.weight.shape != m2.weight.shape:
+                print(f"Shape mismatch: {m1.weight.shape} vs {m2.weight.shape}")
+                return False
+            m1.weight.copy_(m2.weight)
+            return True
     
-    # Generate and print response
-    print("Generating response...")
-    response = model.generate(messages)
-    print("\nFull conversation:")
+    # Copy embeddings
+    copy_weights(model.token_embedding, hf_model.model.embed_tokens)
+    
+    # Copy transformer layers
+    for l1, l2 in zip(model.layers, hf_model.model.layers):
+        # Attention weights
+        if not all([
+            copy_weights(l1.attention.wq, l2.self_attn.q_proj),
+            copy_weights(l1.attention.wk, l2.self_attn.k_proj),
+            copy_weights(l1.attention.wv, l2.self_attn.v_proj),
+            copy_weights(l1.attention.wo, l2.self_attn.o_proj)
+        ]):
+            print("Error in attention weight copying")
+            return None, None
+        
+        # FFN weights
+        if not all([
+            copy_weights(l1.feed_forward.gate_proj, l2.mlp.gate_proj),
+            copy_weights(l1.feed_forward.down_proj, l2.mlp.down_proj),
+            copy_weights(l1.feed_forward.up_proj, l2.mlp.up_proj)
+        ]):
+            print("Error in FFN weight copying")
+            return None, None
+        
+        # Norms
+        if not all([
+            copy_weights(l1.attention_norm, l2.input_layernorm),
+            copy_weights(l1.ffn_norm, l2.post_attention_layernorm)
+        ]):
+            print("Error in norm weight copying")
+            return None, None
+    
+    if not all([
+        copy_weights(model.norm, hf_model.model.norm),
+        copy_weights(model.lm_head, hf_model.lm_head)
+    ]):
+        print("Error in final layer copying")
+        return None, None
+    
+    print("Model loaded successfully!")
+    return model, hf_tokenizer
+
+def main():
+    model, tokenizer = load_model_and_tokenizer()
+    if model is None or tokenizer is None:
+        print("Failed to load model properly")
+        return
+        
+    model.eval()
+    
+    prompt = "The capital of France is Paris, and the capital of Germany is"
+    tokens = tokenizer.encode(prompt, return_tensors='pt')
+    
+    generated = model.generate(
+        tokens,
+        max_new_tokens=20,
+        temperature=0.7,
+        top_k=50
+    )
+    
+    response = tokenizer.decode(generated[0], skip_special_tokens=True)
     print(response)
 
 if __name__ == "__main__":
-    main() 
+    main()
