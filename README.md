@@ -15,7 +15,7 @@ the rrt:
 
 $h_t^l = f(h_t^{l-1}; \Phi^\prime_{((l-1) \bmod L/B + 1)}, \Delta\Phi^{\prime l})$
 
-for each weight matrix at each layer/position:
+for each weight matrix at each layer:
 
 $h = W^\prime x + BAx$ where:
 - $W^\prime$ is learned shared weights
