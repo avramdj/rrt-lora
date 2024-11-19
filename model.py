@@ -209,8 +209,8 @@ class RecursiveLinear(nn.Module):
         # W' - shared weights
         if shared_weight is None:
             self.weight = nn.Parameter(torch.empty((out_features, in_features)))
-            # Initialize shared weights
-            torch.nn.init.normal_(self.weight, mean=0.0, std=0.02)
+            # Initialize shared weights with Kaiming
+            nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='linear')
         else:
             self.weight = shared_weight
             
@@ -230,12 +230,25 @@ class SharedWeights:
             name: nn.Parameter(torch.empty(shape))
             for name, shape in shapes.items()
         }
-        # Initialize all shared weights
+        # Initialize all shared weights with Kaiming
         for weight in self.shared_weights.values():
-            torch.nn.init.normal_(weight, mean=0.0, std=0.02)
+            nn.init.kaiming_normal_(weight, mode='fan_in', nonlinearity='linear')
     
     def get_weight(self, name: str) -> nn.Parameter:
         return self.shared_weights[name]
+
+def kaiming_init(module: nn.Module) -> None:
+    """Initialize using Kaiming initialization"""
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+    elif isinstance(module, LoRALayer):
+        if module.rank > 0:
+            nn.init.kaiming_normal_(module.A, mode='fan_in', nonlinearity='linear')
+            nn.init.kaiming_normal_(module.B, mode='fan_in', nonlinearity='linear')
 
 class RecursiveTinyLlama(nn.Module):
     def __init__(
@@ -285,6 +298,9 @@ class RecursiveTinyLlama(nn.Module):
         self.num_blocks = num_blocks
         self.norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+
+        # Apply Kaiming initialization to all parameters
+        self.apply(kaiming_init)
 
     def forward(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None):
         x = self.token_embedding(tokens)
