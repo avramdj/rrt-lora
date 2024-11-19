@@ -170,7 +170,7 @@ def train_model(
     model: RecursiveTinyLlama,
     tokenizer: Any,
     num_epochs: int = 25,
-    batch_size: int = 4,
+    min_batch_size: int = 32,  # Minimum batch size (for longest sequences)
     learning_rate: float = 1e-4,
     load_checkpoint_if_exists: bool = False,
     save_every: int = 100,
@@ -179,12 +179,17 @@ def train_model(
     """Train the model on wikitext data"""
     device = get_device()
     model = model.to(device)
-
+    
+    # Compute budget (halved from 256*256 = 65,536)
+    tokens_per_batch = 32_768  # 65,536 / 2 = 32,768 tokens per batch
+    
     # Print initial training config
     print("\nTraining configuration:")
-    print(f"Initial batch size: {batch_size}")
-    print(f"Initial sequence length: 32")  # We start with 32
+    print(f"Tokens per batch: {tokens_per_batch:,}")
+    print(f"Initial sequence length: 32")
+    print(f"Initial batch size: {tokens_per_batch // 32}")  # Start with short sequences
     print(f"Max sequence length: 512")
+    print(f"Min batch size: {min_batch_size}")
     print(f"Sequence length increase: +32 every 100 steps")
     
     # Print parameter counts
@@ -207,7 +212,7 @@ def train_model(
         project="relaxed-recursive-tinyllama",
         config={
             "num_epochs": num_epochs,
-            "batch_size": batch_size,
+            "batch_size": min_batch_size,
             "learning_rate": learning_rate,
             "num_blocks": model.num_blocks,
             "num_layers": model.n_layers,
@@ -221,8 +226,16 @@ def train_model(
 
     # Prepare dataset
     dataset = TextDataset(tokenizer)
+    
+    # Start with maximum batch size
+    current_batch_size = tokens_per_batch // 32  # Initial sequence length is 32
+    
     dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
+        dataset, 
+        batch_size=current_batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True
     )
 
     # Prepare optimizer
@@ -254,22 +267,38 @@ def train_model(
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        
+        prev_len = 0
+        prev_bs = current_batch_size
+        
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-
-        prev_len = 0  # Track previous sequence length
+        
         for batch in progress_bar:
             # Dynamic sequence length
             max_len = min(32 + (global_step // 100) * 32, 512)
             
-            # Print when sequence length changes
-            if max_len != prev_len:
-                print(f"\nStep {global_step}: Sequence length increased to {max_len}")
-                prev_len = max_len
+            # Adjust batch size to maintain constant compute, but not below min_batch_size
+            current_batch_size = max(min_batch_size, tokens_per_batch // max_len)
             
-            # Get actual batch size (might be smaller for last batch)
-            current_bs = batch['input_ids'].size(0)
-            if current_bs != batch_size:
-                print(f"\nStep {global_step}: Batch size changed to {current_bs}")
+            # Print when sequence length or batch size changes
+            if max_len != prev_len:
+                print(f"\nStep {global_step}:")
+                print(f"Sequence length increased to {max_len}")
+                print(f"Batch size adjusted to {current_batch_size}")
+                print(f"Tokens per batch: {max_len * current_batch_size:,}")
+                
+                # Create new dataloader with updated batch size
+                dataloader = DataLoader(
+                    dataset, 
+                    batch_size=current_batch_size, 
+                    shuffle=True, 
+                    num_workers=4, 
+                    pin_memory=True
+                )
+                progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+                
+                prev_len = max_len
+                prev_bs = current_batch_size
             
             batch = {
                 k: v[:, :max_len].to(device) 
