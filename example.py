@@ -139,10 +139,14 @@ class TextDataset(Dataset):
                 if len(tokens) > 1:  # Skip very short sequences
                     all_tokens.extend(tokens)
 
-        # Create overlapping sequences
+        # Create fixed-length sequences with overlap
         self.sequences = []
         for i in range(0, len(all_tokens) - max_length, max_length // 2):
-            self.sequences.append(all_tokens[i : i + max_length])
+            seq = all_tokens[i:i + max_length]
+            # Pad sequence if needed
+            if len(seq) < max_length:
+                seq = seq + [tokenizer.pad_token_id] * (max_length - len(seq))
+            self.sequences.append(seq)
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -151,10 +155,14 @@ class TextDataset(Dataset):
         tokens = self.sequences[idx]
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
         labels = torch.tensor(tokens[1:], dtype=torch.long)
+        
+        # Create attention mask (1 for tokens, 0 for padding)
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
 
         return {
             "input_ids": input_ids,
             "labels": labels,
+            "attention_mask": attention_mask,
         }
 
 
@@ -165,8 +173,8 @@ def train_model(
     batch_size: int = 4,
     learning_rate: float = 1e-4,
     load_checkpoint_if_exists: bool = False,
-    save_every: int = 500,
-    sample_every: int = 500,
+    save_every: int = 100,
+    sample_every: int = 100,
 ) -> None:
     """Train the model on wikitext data"""
     device = get_device()
@@ -242,18 +250,29 @@ def train_model(
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         for batch in progress_bar:
-            batch = {k: v.to(device) for k, v in batch.items()}
+            # Dynamic sequence length
+            max_len = min(32 + (global_step // 100) * 32, 512)
+            batch = {
+                k: v[:, :max_len].to(device) 
+                for k, v in batch.items()
+            }
 
             optimizer.zero_grad()
 
-            # Forward pass
-            logits = model(batch["input_ids"])
+            # Create attention mask for the model
+            mask = None
+            if "attention_mask" in batch:
+                mask = batch["attention_mask"].unsqueeze(1).unsqueeze(2)
+                mask = mask @ mask.transpose(-2, -1)
 
-            # Calculate loss
+            # Forward pass with mask
+            logits = model(batch["input_ids"], mask=mask)
+
+            # Calculate loss (ignore padding tokens)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 batch["labels"].view(-1),
-                ignore_index=-100,
+                ignore_index=tokenizer.pad_token_id,
             )
 
             # Backward pass

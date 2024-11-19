@@ -238,17 +238,26 @@ class SharedWeights:
         return self.shared_weights[name]
 
 def kaiming_init(module: nn.Module) -> None:
-    """Initialize using Kaiming initialization"""
+    """Initialize using Kaiming initialization with careful scaling"""
     if isinstance(module, nn.Linear):
+        # Scale by 1/sqrt(fan_in)
+        scale = 1.0 / math.sqrt(module.weight.shape[1])
         nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+        module.weight.data *= scale
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
-        nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+        # Special scaling for embeddings
+        scale = 0.25 / math.sqrt(module.weight.shape[1])
+        nn.init.normal_(module.weight, std=scale)
     elif isinstance(module, LoRALayer):
         if module.rank > 0:
+            # Scale LoRA by 1/sqrt(rank)
+            scale = 1.0 / math.sqrt(module.rank)
             nn.init.kaiming_normal_(module.A, mode='fan_in', nonlinearity='linear')
             nn.init.kaiming_normal_(module.B, mode='fan_in', nonlinearity='linear')
+            module.A.data *= scale
+            module.B.data *= scale
 
 class RecursiveTinyLlama(nn.Module):
     def __init__(
@@ -281,7 +290,6 @@ class RecursiveTinyLlama(nn.Module):
             'ffn_down': (dim, intermediate_size),
         })
         
-        # Create B blocks with shared weights
         self.blocks = nn.ModuleList([
             RecursiveTransformerBlock(
                 dim=dim,
@@ -299,16 +307,19 @@ class RecursiveTinyLlama(nn.Module):
         self.norm = RMSNorm(dim)
         self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
-        # Apply Kaiming initialization to all parameters
+        # Apply initialization
         self.apply(kaiming_init)
+        
+        # Special scaling for output layer
+        scale = 0.5 / math.sqrt(self.lm_head.weight.shape[1])
+        self.lm_head.weight.data *= scale
 
     def forward(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None):
         x = self.token_embedding(tokens)
         
         # Apply layers recursively using blocks
         for l in range(self.n_layers):
-            # Fix the block index calculation
-            block_idx = (l % self.num_blocks)  # Simplified formula since we're 0-based
+            block_idx = (l % self.num_blocks)
             x = self.blocks[block_idx](x, mask)
             
         x = self.norm(x)
