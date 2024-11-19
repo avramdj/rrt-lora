@@ -23,6 +23,7 @@ def get_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+
 ORIGINAL_PARAMS: Optional[int] = None
 
 
@@ -36,20 +37,20 @@ def load_model_and_tokenizer(
     # Load just the tokenizer from TinyLlama
     hf_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
-    
+
     # Define smaller model config (8x smaller than TinyLlama)
     config = {
-        'vocab_size': 32000,  # Keep vocab size same as TinyLlama
-        'hidden_size': 256,   # 2048 -> 256
-        'num_hidden_layers': 8,  # 22 -> 8
-        'num_attention_heads': 8,  # 32 -> 8
-        'intermediate_size': 704,  # 5632 -> 704
-        'hidden_act': "silu",
-        'num_key_value_heads': 4,  # 4 key-value heads (GQA)
+        "vocab_size": 32000,  # Keep vocab size same as TinyLlama
+        "hidden_size": 256,  # 2048 -> 256
+        "num_hidden_layers": 8,  # 22 -> 8
+        "num_attention_heads": 8,  # 32 -> 8
+        "intermediate_size": 704,  # 5632 -> 704
+        "hidden_act": "silu",
+        "num_key_value_heads": 4,  # 4 key-value heads (GQA)
     }
 
     # Calculate and print the full rank size
-    full_rank = config['hidden_size']
+    full_rank = config["hidden_size"]
     if lora_rank is None:
         lora_rank = full_rank // 8
 
@@ -60,13 +61,13 @@ def load_model_and_tokenizer(
     print(f"LoRA rank: {lora_rank}")
 
     model = RecursiveTinyLlama(
-        vocab_size=config['vocab_size'],
-        dim=config['hidden_size'],
-        n_layers=config['num_hidden_layers'],
-        n_heads=config['num_attention_heads'],
-        intermediate_size=config['intermediate_size'],
-        hidden_act=config['hidden_act'],
-        num_key_value_heads=config['num_key_value_heads'],
+        vocab_size=config["vocab_size"],
+        dim=config["hidden_size"],
+        n_layers=config["num_hidden_layers"],
+        n_heads=config["num_attention_heads"],
+        intermediate_size=config["intermediate_size"],
+        hidden_act=config["hidden_act"],
+        num_key_value_heads=config["num_key_value_heads"],
         num_blocks=4,  # Keep 4 blocks for recursion
         lora_rank=lora_rank,
     ).to(device)
@@ -142,7 +143,7 @@ class TextDataset(Dataset):
         # Create fixed-length sequences with overlap
         self.sequences = []
         for i in range(0, len(all_tokens) - max_length, max_length // 2):
-            seq = all_tokens[i:i + max_length]
+            seq = all_tokens[i : i + max_length]
             # Pad sequence if needed
             if len(seq) < max_length:
                 seq = seq + [tokenizer.pad_token_id] * (max_length - len(seq))
@@ -155,7 +156,7 @@ class TextDataset(Dataset):
         tokens = self.sequences[idx]
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
         labels = torch.tensor(tokens[1:], dtype=torch.long)
-        
+
         # Create attention mask (1 for tokens, 0 for padding)
         attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
 
@@ -179,19 +180,23 @@ def train_model(
     """Train the model on wikitext data"""
     device = get_device()
     model = model.to(device)
-    
+
     # Compute budget (halved from 256*256 = 65,536)
     tokens_per_batch = 32_768  # 65,536 / 2 = 32,768 tokens per batch
-    
+
+    # Start with smallest sequence length
+    min_seq_len = 32
+    max_seq_len = 512
+
     # Print initial training config
     print("\nTraining configuration:")
     print(f"Tokens per batch: {tokens_per_batch:,}")
-    print(f"Initial sequence length: 32")
-    print(f"Initial batch size: {tokens_per_batch // 32}")  # Start with short sequences
-    print(f"Max sequence length: 512")
+    print(f"Initial sequence length: {min_seq_len}")
+    print(f"Initial batch size: {tokens_per_batch // min_seq_len}")
+    print(f"Final sequence length: {max_seq_len}")
     print(f"Min batch size: {min_batch_size}")
-    print(f"Sequence length increase: +32 every 100 steps")
-    
+    print("Sequence length increase: +32 every 100 steps")
+
     # Print parameter counts
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -226,16 +231,18 @@ def train_model(
 
     # Prepare dataset
     dataset = TextDataset(tokenizer)
-    
+
     # Start with maximum batch size
-    current_batch_size = tokens_per_batch // 32  # Initial sequence length is 32
-    
+    current_batch_size = (
+        tokens_per_batch // min_seq_len
+    )  # Initial sequence length is 32
+
     dataloader = DataLoader(
-        dataset, 
-        batch_size=current_batch_size, 
-        shuffle=True, 
-        num_workers=4, 
-        pin_memory=True
+        dataset,
+        batch_size=current_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
     )
 
     # Prepare optimizer
@@ -267,43 +274,45 @@ def train_model(
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
-        
+
         prev_len = 0
         prev_bs = current_batch_size
-        
+
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        
+
         for batch in progress_bar:
-            # Dynamic sequence length
-            max_len = min(32 + (global_step // 100) * 32, 512)
-            
+            # Dynamic sequence length - start small and increase
+            remaining_steps = max(0, (max_seq_len - min_seq_len) // 32)
+            current_seq_len = (
+                max_seq_len - min(remaining_steps, (global_step // 100)) * 32
+            )
+
             # Adjust batch size to maintain constant compute, but not below min_batch_size
-            current_batch_size = max(min_batch_size, tokens_per_batch // max_len)
-            
+            current_batch_size = max(
+                min_batch_size, tokens_per_batch // current_seq_len
+            )
+
             # Print when sequence length or batch size changes
-            if max_len != prev_len:
+            if current_seq_len != prev_len:
                 print(f"\nStep {global_step}:")
-                print(f"Sequence length increased to {max_len}")
+                print(f"Sequence length set to {current_seq_len}")
                 print(f"Batch size adjusted to {current_batch_size}")
-                print(f"Tokens per batch: {max_len * current_batch_size:,}")
-                
+                print(f"Tokens per batch: {current_seq_len * current_batch_size:,}")
+
                 # Create new dataloader with updated batch size
                 dataloader = DataLoader(
-                    dataset, 
-                    batch_size=current_batch_size, 
-                    shuffle=True, 
-                    num_workers=4, 
-                    pin_memory=True
+                    dataset,
+                    batch_size=current_batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    pin_memory=True,
                 )
                 progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-                
-                prev_len = max_len
+
+                prev_len = current_seq_len
                 prev_bs = current_batch_size
-            
-            batch = {
-                k: v[:, :max_len].to(device) 
-                for k, v in batch.items()
-            }
+
+            batch = {k: v[:, :current_seq_len].to(device) for k, v in batch.items()}
 
             optimizer.zero_grad()
 
