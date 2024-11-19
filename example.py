@@ -180,6 +180,13 @@ def train_model(
     device = get_device()
     model = model.to(device)
 
+    # Print initial training config
+    print("\nTraining configuration:")
+    print(f"Initial batch size: {batch_size}")
+    print(f"Initial sequence length: 32")  # We start with 32
+    print(f"Max sequence length: 512")
+    print(f"Sequence length increase: +32 every 100 steps")
+    
     # Print parameter counts
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -249,9 +256,21 @@ def train_model(
         model.train()
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
+        prev_len = 0  # Track previous sequence length
         for batch in progress_bar:
             # Dynamic sequence length
             max_len = min(32 + (global_step // 100) * 32, 512)
+            
+            # Print when sequence length changes
+            if max_len != prev_len:
+                print(f"\nStep {global_step}: Sequence length increased to {max_len}")
+                prev_len = max_len
+            
+            # Get actual batch size (might be smaller for last batch)
+            current_bs = batch['input_ids'].size(0)
+            if current_bs != batch_size:
+                print(f"\nStep {global_step}: Batch size changed to {current_bs}")
+            
             batch = {
                 k: v[:, :max_len].to(device) 
                 for k, v in batch.items()
