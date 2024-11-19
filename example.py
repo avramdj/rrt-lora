@@ -23,12 +23,15 @@ def get_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+ORIGINAL_PARAMS: Optional[int] = None
+
 
 def load_model_and_tokenizer(
     lora_rank: Optional[int] = None,
 ) -> Tuple[
     Optional[RecursiveTinyLlama], Optional[Any], Optional[Dict[str, torch.Tensor]]
 ]:
+    global ORIGINAL_PARAMS
     device = get_device()
 
     # First load the HF model and tokenizer
@@ -36,6 +39,8 @@ def load_model_and_tokenizer(
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name).to(device)
     print(hf_model.model)
+    ORIGINAL_PARAMS = sum(p.numel() for p in hf_model.parameters())
+    print(f"Original parameters: {ORIGINAL_PARAMS:,}")
 
     # Create our custom model with same config
     config = hf_model.config
@@ -47,7 +52,7 @@ def load_model_and_tokenizer(
 
     print("\nWeight matrix dimensions:")
     print(f"Full rank: {full_rank}")
-    print(f"LoRA rank: {lora_rank} (reduction: {lora_rank/full_rank*100:.2f}%)")
+    print(f"LoRA rank: {lora_rank}")
 
     model = RecursiveTinyLlama(
         vocab_size=config.vocab_size,
@@ -196,10 +201,15 @@ def train_model(
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     lora_rank = model.blocks[0].attention.wq.lora.rank  # Get LoRA rank from model
 
-    print(f"\nParameter counts:")
+    print("\nParameter counts:")
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"LoRA rank: {lora_rank}")
+
+    print(f"Original parameters: {ORIGINAL_PARAMS:,}")
+    print(
+        f"Reduction: {100*(1-total_params/ORIGINAL_PARAMS):.2f}%"
+    )
 
     # Initialize wandb
     wandb.init(
