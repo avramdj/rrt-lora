@@ -10,6 +10,9 @@ from typing import Tuple, Optional, Dict, Any
 from model import RecursiveTinyLlama
 import wandb
 from tqdm import tqdm
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
+import math
 
 
 def get_device() -> torch.device:
@@ -20,11 +23,9 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_model_and_tokenizer() -> (
-    Tuple[
-        Optional[RecursiveTinyLlama], Optional[Any], Optional[Dict[str, torch.Tensor]]
-    ]
-):
+def load_model_and_tokenizer(
+    lora_rank: Optional[int] = None
+) -> Tuple[Optional[RecursiveTinyLlama], Optional[Any], Optional[Dict[str, torch.Tensor]]]:
     device = get_device()
 
     # First load the HF model and tokenizer
@@ -38,7 +39,9 @@ def load_model_and_tokenizer() -> (
 
     # Calculate and print the full rank size
     full_rank = config.hidden_size  # This is the dimension of the weight matrices
-    lora_rank = full_rank // 8  # The reduced rank we'll use
+    if lora_rank is None:
+        lora_rank = full_rank // 8  # Default to hidden_size/8 if not specified
+    
     print("\nWeight matrix dimensions:")
     print(f"Full rank: {full_rank} x {full_rank}")
     print(f"LoRA rank: {lora_rank} (reduction: {lora_rank/full_rank*100:.2f}%)")
@@ -52,7 +55,7 @@ def load_model_and_tokenizer() -> (
         hidden_act=config.hidden_act,
         num_key_value_heads=config.num_key_value_heads,
         num_blocks=4,
-        lora_rank=lora_rank,  # Pass the rank to the model
+        lora_rank=lora_rank,
     ).to(device)
 
     # Store original weights with better keys
@@ -132,149 +135,169 @@ def generate_sample(
     return response
 
 
-def train_weight_matching(
+class TextDataset(Dataset):
+    def __init__(self, tokenizer, max_length: int = 512):
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+        # Process text in chunks
+        all_tokens = []
+        for item in dataset:
+            if item["text"].strip():  # Skip empty lines
+                tokens = tokenizer.encode(item["text"])
+                if len(tokens) > 1:  # Skip very short sequences
+                    all_tokens.extend(tokens)
+        
+        # Create overlapping sequences
+        self.sequences = []
+        for i in range(0, len(all_tokens) - max_length, max_length // 2):
+            self.sequences.append(all_tokens[i:i + max_length])
+    
+    def __len__(self) -> int:
+        return len(self.sequences)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        tokens = self.sequences[idx]
+        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+        labels = torch.tensor(tokens[1:], dtype=torch.long)
+        
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+        }
+
+def train_model(
     model: RecursiveTinyLlama,
-    original_weights: Dict[str, torch.Tensor],
     tokenizer: Any,
-    num_iterations: int = 10000,
+    num_epochs: int = 25,
+    batch_size: int = 4,
     learning_rate: float = 1e-4,
     load_checkpoint_if_exists: bool = False,
-    checkpoint_every: int = 1000,
+    save_every: int = 500,
     sample_every: int = 500,
 ) -> None:
-    """Train shared weights W' and LoRA weights BA to match original layer weights"""
+    """Train the model on wikitext data"""
     device = get_device()
     model = model.to(device)
-
-    # Print LoRA parameter counts
-    total_params = 0
-    lora_params = 0
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            lora_params += param.numel()
-        total_params += param.numel()
-
+    
+    # Print parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lora_rank = model.blocks[0].attention.wq.lora.rank  # Get LoRA rank from model
+    
     print(f"\nParameter counts:")
     print(f"Total parameters: {total_params:,}")
-    print(f"LoRA parameters: {lora_params:,} ({lora_params/total_params*100:.2f}%)")
-
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"LoRA rank: {lora_rank}")
+    
+    # Initialize wandb
     wandb.init(
         project="relaxed-recursive-tinyllama",
         config={
-            "num_iterations": num_iterations,
+            "num_epochs": num_epochs,
+            "batch_size": batch_size,
             "learning_rate": learning_rate,
             "num_blocks": model.num_blocks,
             "num_layers": model.n_layers,
-            "lora_rank": model.blocks[0].attention.wq.lora.rank,  # Log LoRA rank
             "total_params": total_params,
-            "lora_params": lora_params,
+            "trainable_params": trainable_params,
+            "lora_rank": lora_rank,  # Add LoRA rank to config
+            "compression_ratio": lora_rank / model.blocks[0].attention.wq.weight.shape[0],  # r/d ratio
         },
     )
-
-    optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": [p for n, p in model.named_parameters() if "lora" in n],
-                "lr": learning_rate,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if "weight" in n and "lora" not in n
-                ],
-                "lr": learning_rate / 4,
-            },
-        ]
+    
+    # Prepare dataset
+    dataset = TextDataset(tokenizer)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
     )
-
-    start_step = 0
-    best_loss = float("inf")
-
+    
+    # Prepare optimizer
+    optimizer = torch.optim.AdamW([
+        {'params': [p for n, p in model.named_parameters() if 'lora' in n], 'lr': learning_rate},
+        {'params': [p for n, p in model.named_parameters() if 'weight' in n and 'lora' not in n], 'lr': learning_rate/4}
+    ])
+    
+    start_epoch = 0
+    global_step = 0
+    best_loss = float('inf')
+    
     if load_checkpoint_if_exists:
-        start_step, best_loss = load_checkpoint(model, optimizer)
-
-    progress_bar = tqdm(range(start_step, num_iterations), desc="Training")
-
+        global_step, best_loss = load_checkpoint(model, optimizer)
+    
     test_prompt = "The capital of France is Paris, and the capital of Germany is"
-
-    for step in progress_bar:
-        total_loss = torch.tensor(0.0, device=device)
-        optimizer.zero_grad()
-
-        for block_idx, block in enumerate(model.blocks):
-            layer_indices = [
-                i for i in range(model.n_layers) if i % model.num_blocks == block_idx
-            ]
-
-            for layer_idx in layer_indices:
-                for name, module in [
-                    ("q", block.attention.wq),
-                    ("k", block.attention.wk),
-                    ("v", block.attention.wv),
-                    ("o", block.attention.wo),
-                ]:
-                    orig_key = f"layer_{layer_idx}_{name}"
-                    if orig_key not in original_weights:
-                        continue
-
-                    orig_weight = original_weights[orig_key].to(device)
-                    current_weight = module.weight + (module.lora.B @ module.lora.A)
-
-                    loss = F.mse_loss(current_weight, orig_weight)
-                    total_loss += loss
-
-        total_loss.backward()
-        optimizer.step()
-
-        # Log metrics
-        loss_value = total_loss.item()
-        wandb.log({"total_loss": loss_value, "step": step})
-
-        progress_bar.set_postfix({"loss": loss_value})
-
-        # Generate sample every sample_every steps
-        if step > 0 and step % sample_every == 0:
-            sample = generate_sample(model, tokenizer, device, test_prompt)
-            print(f"\nStep {step}, Loss {loss_value:.4f}")
-            print(f"Sample: {sample}\n")
-            wandb.log({"sample_text": sample, "step": step})
-
-        # Save checkpoint every checkpoint_every steps if loss improved
-        if step > 0 and step % checkpoint_every == 0 and loss_value < best_loss:
-            best_loss = loss_value
-            save_checkpoint(model, optimizer, step, loss_value)
-
+    
+    for epoch in range(start_epoch, num_epochs):
+        model.train()
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
+        for batch in progress_bar:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            logits = model(batch['input_ids'])
+            
+            # Calculate loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                batch['labels'].view(-1),
+                ignore_index=-100
+            )
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            loss_value = loss.item()
+            
+            # Log metrics
+            wandb.log({
+                "loss": loss_value,
+                "perplexity": math.exp(loss_value),
+                "epoch": epoch,
+                "global_step": global_step,
+            })
+            
+            progress_bar.set_postfix({"loss": f"{loss_value:.4f}"})
+            
+            # Generate sample periodically
+            if global_step > 0 and global_step % sample_every == 0:
+                sample = generate_sample(model, tokenizer, device, test_prompt)
+                print(f"\nStep {global_step}, Loss {loss_value:.4f}")
+                print(f"Sample: {sample}\n")
+                wandb.log({"sample_text": sample, "step": global_step})
+            
+            # Save checkpoint periodically
+            if global_step > 0 and global_step % save_every == 0:
+                save_checkpoint(model, optimizer, global_step, loss_value)
+            
+            global_step += 1
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--load", action="store_true", help="Load checkpoint if it exists"
-    )
+    parser.add_argument("--load", action="store_true", help="Load checkpoint if it exists")
+    parser.add_argument("-r", "--rank", type=int, help="LoRA rank (default: hidden_size/8)", default=None)
     args = parser.parse_args()
-
+    
     device = get_device()
     print(f"Using device: {device}")
-
-    model, tokenizer, original_weights = load_model_and_tokenizer()
-    if model is None or tokenizer is None or original_weights is None:
+    
+    # Load models
+    model, tokenizer, _ = load_model_and_tokenizer(lora_rank=args.rank)
+    if model is None or tokenizer is None:
         print("Failed to load model properly")
         return
-
-    train_weight_matching(
-        model, original_weights, tokenizer, load_checkpoint_if_exists=args.load
-    )
-
-    # Final test generation
-    sample = generate_sample(
-        model,
-        tokenizer,
-        device,
-        "The capital of France is Paris, and the capital of Germany is",
-    )
-    print("\nFinal generation:")
-    print(sample)
-
+    
+    # Train the model
+    train_model(model, tokenizer, load_checkpoint_if_exists=args.load)
 
 if __name__ == "__main__":
     main()
