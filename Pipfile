@@ -8,6 +8,8 @@ torch = "*"
 safetensors = "*"
 transformers = "*"
 accelerate = "*"
+wandb = "*"
+datasets = "*"
 
 [dev-packages]
 
