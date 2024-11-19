@@ -46,7 +46,7 @@ def load_model_and_tokenizer(
         lora_rank = full_rank // 8  # Default to hidden_size/8 if not specified
 
     print("\nWeight matrix dimensions:")
-    print(f"Full rank: {full_rank} x {full_rank}")
+    print(f"Full rank: {full_rank}")
     print(f"LoRA rank: {lora_rank} (reduction: {lora_rank/full_rank*100:.2f}%)")
 
     model = RecursiveTinyLlama(
