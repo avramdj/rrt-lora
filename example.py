@@ -31,79 +31,55 @@ def load_model_and_tokenizer(
 ) -> Tuple[
     Optional[RecursiveTinyLlama], Optional[Any], Optional[Dict[str, torch.Tensor]]
 ]:
-    global ORIGINAL_PARAMS
     device = get_device()
 
-    # First load the HF model and tokenizer
+    # Load just the tokenizer from TinyLlama
     hf_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
-    hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name).to(device)
-    print(hf_model.model)
-    ORIGINAL_PARAMS = sum(p.numel() for p in hf_model.parameters())
-    print(f"Original parameters: {ORIGINAL_PARAMS:,}")
-
-    # Create our custom model with same config
-    config = hf_model.config
+    
+    # Define smaller model config (8x smaller than TinyLlama)
+    config = {
+        'vocab_size': 32000,  # Keep vocab size same as TinyLlama
+        'hidden_size': 256,   # 2048 -> 256
+        'num_hidden_layers': 8,  # 22 -> 8
+        'num_attention_heads': 8,  # 32 -> 8
+        'intermediate_size': 704,  # 5632 -> 704
+        'hidden_act': "silu",
+        'num_key_value_heads': 4,  # 4 key-value heads (GQA)
+    }
 
     # Calculate and print the full rank size
-    full_rank = config.hidden_size  # This is the dimension of the weight matrices
+    full_rank = config['hidden_size']
     if lora_rank is None:
-        lora_rank = full_rank // 8  # Default to hidden_size/8 if not specified
+        lora_rank = full_rank // 8
 
-    print("\nWeight matrix dimensions:")
-    print(f"Full rank: {full_rank}")
+    print("\nModel dimensions:")
+    print(f"Hidden size: {config['hidden_size']}")
+    print(f"Num layers: {config['num_hidden_layers']}")
+    print(f"Num heads: {config['num_attention_heads']}")
     print(f"LoRA rank: {lora_rank}")
 
     model = RecursiveTinyLlama(
-        vocab_size=config.vocab_size,
-        dim=config.hidden_size,
-        n_layers=config.num_hidden_layers,
-        n_heads=config.num_attention_heads,
-        intermediate_size=config.intermediate_size,
-        hidden_act=config.hidden_act,
-        num_key_value_heads=config.num_key_value_heads,
-        num_blocks=4,
+        vocab_size=config['vocab_size'],
+        dim=config['hidden_size'],
+        n_layers=config['num_hidden_layers'],
+        n_heads=config['num_attention_heads'],
+        intermediate_size=config['intermediate_size'],
+        hidden_act=config['hidden_act'],
+        num_key_value_heads=config['num_key_value_heads'],
+        num_blocks=4,  # Keep 4 blocks for recursion
         lora_rank=lora_rank,
     ).to(device)
 
     print("Compiling model...")
     begin = time()
-    model = torch.compile(model, fullgraph=True, mode="max-autotune")
+    # model = torch.compile(model, fullgraph=True, mode="max-autotune")
     end = time()
     print(f"Model compiled in {end - begin:.2f} seconds")
 
-    # Store original weights with better keys
-    original_weights: Dict[str, torch.Tensor] = {}
-
-    def copy_weights(
-        m1: torch.nn.Module, m2: torch.nn.Module, layer_idx: int, weight_type: str
-    ) -> bool:
-        with torch.no_grad():
-            if m1.weight.shape != m2.weight.shape:
-                print(f"Shape mismatch: {m1.weight.shape} vs {m2.weight.shape}")
-                return False
-            key = f"layer_{layer_idx}_{weight_type}"
-            original_weights[key] = m2.weight.clone()
-            m1.weight.copy_(m2.weight)
-            return True
-
-    # Copy transformer layers with proper indexing
-    for block_idx, block in enumerate(model.blocks):
-        # Copy weights from corresponding HF layer
-        l2 = hf_model.model.layers[block_idx]
-        if not all(
-            [
-                copy_weights(block.attention.wq, l2.self_attn.q_proj, block_idx, "q"),
-                copy_weights(block.attention.wk, l2.self_attn.k_proj, block_idx, "k"),
-                copy_weights(block.attention.wv, l2.self_attn.v_proj, block_idx, "v"),
-                copy_weights(block.attention.wo, l2.self_attn.o_proj, block_idx, "o"),
-            ]
-        ):
-            print(f"Error in attention weight copying for block {block_idx}")
-            return None, None, None
-
-    print("Model loaded successfully!")
-    return model, hf_tokenizer, original_weights
+    # Initialize weights from scratch (no copying)
+    print("Model initialized from scratch!")
+    return model, hf_tokenizer, {}  # Empty dict since we're not copying weights
 
 
 def save_checkpoint(
@@ -206,10 +182,10 @@ def train_model(
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"LoRA rank: {lora_rank}")
 
-    print(f"Original parameters: {ORIGINAL_PARAMS:,}")
-    print(
-        f"Reduction: {100*(1-total_params/ORIGINAL_PARAMS):.2f}%"
-    )
+    # print(f"Original parameters: {ORIGINAL_PARAMS:,}")
+    # print(
+    #     f"Reduction: {100*(1-total_params/ORIGINAL_PARAMS):.2f}%"
+    # )
 
     # Initialize wandb
     wandb.init(

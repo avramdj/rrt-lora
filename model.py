@@ -76,10 +76,11 @@ class Attention(nn.Module):
             self.wq = RecursiveLinear(dim, dim, False, 
                 shared_weights.get_weight('attn_q'),
                 lora_rank, init_weights.get('q') if init_weights else None)
-            self.wk = RecursiveLinear(dim, dim//8, False,
+            kv_dim = self.num_key_value_heads * self.head_dim
+            self.wk = RecursiveLinear(dim, kv_dim, False,
                 shared_weights.get_weight('attn_k'),
                 lora_rank, init_weights.get('k') if init_weights else None)
-            self.wv = RecursiveLinear(dim, dim//8, False,
+            self.wv = RecursiveLinear(dim, kv_dim, False,
                 shared_weights.get_weight('attn_v'),
                 lora_rank, init_weights.get('v') if init_weights else None)
             self.wo = RecursiveLinear(dim, dim, False,
@@ -87,8 +88,9 @@ class Attention(nn.Module):
                 lora_rank, init_weights.get('o') if init_weights else None)
         else:
             self.wq = nn.Linear(dim, dim, bias=False)
-            self.wk = nn.Linear(dim, dim//8, bias=False)
-            self.wv = nn.Linear(dim, dim//8, bias=False)
+            kv_dim = self.num_key_value_heads * self.head_dim
+            self.wk = nn.Linear(dim, kv_dim, bias=False)
+            self.wv = nn.Linear(dim, kv_dim, bias=False)
             self.wo = nn.Linear(dim, dim, bias=False)
         
         self.rope = RotaryEmbedding(self.head_dim)
@@ -245,17 +247,21 @@ class RecursiveTinyLlama(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         num_key_value_heads: int,
-        num_blocks: int,  # B in the paper
-        lora_rank: int = 4,  # Add LoRA rank parameter
+        num_blocks: int,
+        lora_rank: int = 4,
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, dim)
         
-        # Initialize shared weights
+        # Calculate key-value dimension
+        head_dim = dim // n_heads
+        kv_dim = num_key_value_heads * head_dim
+        
+        # Initialize shared weights with correct dimensions
         shared_weights = SharedWeights({
             'attn_q': (dim, dim),
-            'attn_k': (dim//8, dim),
-            'attn_v': (dim//8, dim),
+            'attn_k': (kv_dim, dim),
+            'attn_v': (kv_dim, dim),
             'attn_o': (dim, dim),
             'ffn_gate': (intermediate_size, dim),
             'ffn_up': (intermediate_size, dim),
