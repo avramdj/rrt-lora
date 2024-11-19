@@ -188,18 +188,18 @@ def train_model(
     # Compute budget (halved again from 32,768)
     tokens_per_batch = 16_384  # 32,768 / 2 = 16,384 tokens per batch
 
-    # Start with smallest sequence length
+    # Start with longest sequence length
     min_seq_len = 32
     max_seq_len = 512
 
     # Print initial training config
     print("\nTraining configuration:")
     print(f"Tokens per batch: {tokens_per_batch:,}")
-    print(f"Initial sequence length: {min_seq_len}")
-    print(f"Initial batch size: {tokens_per_batch // min_seq_len}")  # Should be 512
-    print(f"Final sequence length: {max_seq_len}")
-    print(f"Min batch size: {min_batch_size}")
-    print("Sequence length increase: +32 every 100 steps")
+    print(f"Initial sequence length: {max_seq_len}")
+    print(f"Initial batch size: {min_batch_size}")  # Will start with min batch size
+    print(f"Final sequence length: {min_seq_len}")
+    print(f"Max batch size: {tokens_per_batch // min_seq_len}")
+    print("Sequence length decrease: -32 every 100 steps")
 
     # Print parameter counts
     total_params = sum(p.numel() for p in model.parameters())
@@ -283,10 +283,12 @@ def train_model(
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         for batch in progress_bar:
-            # Update sequence length
-            current_seq_len = min(
-                min_seq_len + (global_step // 100) * 32,
-                max_seq_len
+            # Update sequence length - start long and decrease
+            steps_taken = global_step // 100
+            num_decrements = (max_seq_len - min_seq_len) // 32
+            current_seq_len = max(
+                max_seq_len - min(num_decrements, steps_taken) * 32,
+                min_seq_len
             )
             
             # If sequence length changed, update dataset and dataloader
@@ -295,8 +297,8 @@ def train_model(
                 current_batch_size = max(min_batch_size, tokens_per_batch // current_seq_len)
                 
                 print(f"\nStep {global_step}:")
-                print(f"Sequence length set to {current_seq_len}")
-                print(f"Batch size adjusted to {current_batch_size}")
+                print(f"Sequence length decreased to {current_seq_len}")
+                print(f"Batch size increased to {current_batch_size}")
                 print(f"Tokens per batch: {current_seq_len * current_batch_size:,}")
                 print(f"Total sequences: {len(dataset):,}")
                 
