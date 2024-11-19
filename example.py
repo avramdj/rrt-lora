@@ -140,24 +140,28 @@ class TextDataset(Dataset):
                 if len(tokens) > 1:  # Skip very short sequences
                     all_tokens.extend(tokens)
 
-        # Create fixed-length sequences with overlap
-        self.sequences = []
-        for i in range(0, len(all_tokens) - max_length, max_length // 2):
-            seq = all_tokens[i : i + max_length]
-            # Pad sequence if needed
-            if len(seq) < max_length:
-                seq = seq + [tokenizer.pad_token_id] * (max_length - len(seq))
-            self.sequences.append(seq)
+        # Store all tokens and handle slicing during __getitem__
+        self.tokens = all_tokens
+        self.current_seq_len = max_length  # Will be updated during training
+
+    def set_sequence_length(self, seq_len: int) -> None:
+        """Update current sequence length"""
+        self.current_seq_len = seq_len
 
     def __len__(self) -> int:
-        return len(self.sequences)
+        # Return number of possible sequences given current sequence length
+        return max(0, len(self.tokens) - self.current_seq_len)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        tokens = self.sequences[idx]
+        # Get sequence using current sequence length
+        tokens = self.tokens[idx:idx + self.current_seq_len + 1]  # +1 for labels
+        
+        # Pad if needed
+        if len(tokens) < self.current_seq_len + 1:
+            tokens = tokens + [self.tokenizer.pad_token_id] * (self.current_seq_len + 1 - len(tokens))
+        
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
         labels = torch.tensor(tokens[1:], dtype=torch.long)
-
-        # Create attention mask (1 for tokens, 0 for padding)
         attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
 
         return {
@@ -171,7 +175,7 @@ def train_model(
     model: RecursiveTinyLlama,
     tokenizer: Any,
     num_epochs: int = 25,
-    min_batch_size: int = 32,  # Minimum batch size (for longest sequences)
+    min_batch_size: int = 32,
     learning_rate: float = 1e-4,
     load_checkpoint_if_exists: bool = False,
     save_every: int = 100,
@@ -274,30 +278,28 @@ def train_model(
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
-
         prev_len = 0
-        prev_bs = current_batch_size
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         for batch in progress_bar:
-            # Dynamic sequence length - start small and increase
+            # Update sequence length
             current_seq_len = min(
-                min_seq_len + (global_step // 100) * 32,  # Increase by 32 every 100 steps
-                max_seq_len  # Cap at max_seq_len
+                min_seq_len + (global_step // 100) * 32,
+                max_seq_len
             )
-
-            # Adjust batch size to maintain constant compute, but not below min_batch_size
-            current_batch_size = max(min_batch_size, tokens_per_batch // current_seq_len)
-
-            # Print when sequence length or batch size changes
+            
+            # If sequence length changed, update dataset and dataloader
             if current_seq_len != prev_len:
+                dataset.set_sequence_length(current_seq_len)
+                current_batch_size = max(min_batch_size, tokens_per_batch // current_seq_len)
+                
                 print(f"\nStep {global_step}:")
                 print(f"Sequence length set to {current_seq_len}")
                 print(f"Batch size adjusted to {current_batch_size}")
                 print(f"Tokens per batch: {current_seq_len * current_batch_size:,}")
-
-                # Create new dataloader with updated batch size
+                print(f"Total sequences: {len(dataset):,}")
+                
                 dataloader = DataLoader(
                     dataset,
                     batch_size=current_batch_size,
@@ -306,9 +308,7 @@ def train_model(
                     pin_memory=True,
                 )
                 progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-
                 prev_len = current_seq_len
-                prev_bs = current_batch_size
 
             batch = {k: v[:, :current_seq_len].to(device) for k, v in batch.items()}
 
