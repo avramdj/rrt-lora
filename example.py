@@ -7,7 +7,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import Tuple, Optional, Dict, Any
+from typing import Callable, Tuple, Optional, Dict, Any, TypeVar
 from model import RecursiveTinyLlama
 import wandb
 from tqdm import tqdm
@@ -23,7 +23,19 @@ def get_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+
 ORIGINAL_PARAMS: Optional[int] = None
+
+InputT = TypeVar("InputT")
+OutputT = TypeVar("OutputT")
+
+
+def compile(
+    model: Callable[[InputT], OutputT], *args, **kwargs
+) -> Callable[[InputT], OutputT]:
+    if get_device() == torch.device("cuda"):
+        return torch.compile(model, *args, **kwargs)
+    return model
 
 
 def load_model_and_tokenizer(
@@ -63,12 +75,12 @@ def load_model_and_tokenizer(
         hidden_act=config.hidden_act,
         num_key_value_heads=config.num_key_value_heads,
         num_blocks=4,
-        lora_rank=lora_rank,
+        lora_rank=int(lora_rank),  # type: ignore
     ).to(device)
 
     print("Compiling model...")
     begin = time()
-    model = torch.compile(model, fullgraph=False, mode="default")
+    model = compile(model, fullgraph=False, mode="default")
     end = time()
     print(f"Model compiled in {end - begin:.2f} seconds")
 
@@ -207,9 +219,7 @@ def train_model(
     print(f"LoRA rank: {lora_rank}")
 
     print(f"Original parameters: {ORIGINAL_PARAMS:,}")
-    print(
-        f"Reduction: {100*(1-total_params/ORIGINAL_PARAMS):.2f}%"
-    )
+    print(f"Reduction: {100*(1-total_params/ORIGINAL_PARAMS):.2f}%")
 
     # Initialize wandb
     wandb.init(
