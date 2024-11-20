@@ -68,7 +68,7 @@ def load_model_and_tokenizer(
 
     print("Compiling model...")
     begin = time()
-    model = torch.compile(model, fullgraph=True, mode="max-autotune")
+    model = torch.compile(model, fullgraph=False, mode="default")
     end = time()
     print(f"Model compiled in {end - begin:.2f} seconds")
 
