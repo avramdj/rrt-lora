@@ -74,6 +74,11 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = dim // n_heads
 
+        self.wq: RecursiveLinear | nn.Linear
+        self.wk: RecursiveLinear | nn.Linear
+        self.wv: RecursiveLinear | nn.Linear
+        self.wo: RecursiveLinear | nn.Linear
+
         # Get shared weights if provided, else create new ones
         if shared_weights is not None:
             self.wq = RecursiveLinear(
@@ -327,9 +332,11 @@ class RecursiveTinyLlama(nn.Module):
         x = self.token_embedding(tokens)
 
         # Apply layers recursively using blocks
-        for l in range(self.n_layers):
+        for layer_idx in range(self.n_layers):
             # Fix the block index calculation
-            block_idx = l % self.num_blocks  # Simplified formula since we're 0-based
+            block_idx = (
+                layer_idx % self.num_blocks
+            )  # Simplified formula since we're 0-based
             x = self.blocks[block_idx](x, mask)
 
         x = self.norm(x)
