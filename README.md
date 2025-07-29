@@ -41,7 +41,3 @@ so the final learned mapping approximates:
 
 $W^l \approx W^\prime_{((l-1) \bmod L/B + 1)} + B^lA^l$
 
-## control with rank r
-- $r = 0$: pure recursive ($W^l \approx W^\prime$)
-- small $r$: mostly shared with slight adjustments
-- full $r$: can recover original ($W^l = W^\prime + BA$)
