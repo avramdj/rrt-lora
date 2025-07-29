@@ -1,5 +1,6 @@
-from typing import Optional, Tuple
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,24 +18,24 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
-class RotaryEmbedding:
+class RotaryEmbedding(nn.Module):
     def __init__(
         self, dim: int, max_seq_len: int = 2048, device: Optional[torch.device] = None
     ):
+        super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.device = device
 
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float()
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, dim, 2, device=device).float() / dim)
+        )
+        t = torch.arange(max_seq_len, device=device).float()
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
-        # Initialize on CPU, will move to correct device in __call__
-        self.register_buffer = {
-            "cos": emb.cos()[None, None, :, :],
-            "sin": emb.sin()[None, None, :, :],
-        }
+        self.register_buffer("cos", emb.cos()[None, None, :, :])
+        self.register_buffer("sin", emb.sin()[None, None, :, :])
 
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -42,17 +43,9 @@ class RotaryEmbedding:
 
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, seq_len: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Move embeddings to the same device as input tensors
-        device = q.device
-        if device != self.device:
-            self.device = device
-            self.register_buffer = {
-                key: tensor.to(device) for key, tensor in self.register_buffer.items()
-            }
-
-        cos = self.register_buffer["cos"][:, :, :seq_len, :]
-        sin = self.register_buffer["sin"][:, :, :seq_len, :]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = self.cos[:, :, :seq_len, :]
+        sin = self.sin[:, :, :seq_len, :]
 
         q_rot = (q * cos) + (self.rotate_half(q) * sin)
         k_rot = (k * cos) + (self.rotate_half(k) * sin)
@@ -133,6 +126,10 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
 
         q, k = self.rope(q, k, T)
+
+        # return F.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=True, enable_gqa=True
+        # )
 
         if self.num_key_value_heads != self.n_heads:
             k = k.repeat_interleave(self.n_heads // self.num_key_value_heads, dim=1)
@@ -230,6 +227,9 @@ class LoRALayer(nn.Module):
         # First multiply A with x, then B with the result
         return F.linear(F.linear(x, self.A), self.B)
 
+    def get_weight(self) -> torch.Tensor:
+        return self.B @ self.A
+
 
 class RecursiveLinear(nn.Module):
     def __init__(
@@ -253,14 +253,14 @@ class RecursiveLinear(nn.Module):
         else:
             self.weight = shared_weight
 
-        # Position-specific LoRA components
         self.lora = LoRALayer(in_features, out_features, lora_rank, init_weights)
 
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # W'x + BAx
-        return F.linear(x, self.weight) + self.lora(x)
+        # W'x + BAx as (W' + BA)x
+        # return F.linear(x, self.weight) + self.lora(x)
+        return F.linear(x, self.weight + self.lora.get_weight())
 
 
 class SharedWeights:
