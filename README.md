@@ -1,5 +1,5 @@
 # Relaxed Recursive Transformers
-https://arxiv.org/abs/2410.20672
+Implementation of [RRT-LoRA](https://arxiv.org/abs/2410.20672) by Google DeepMind on TinyLlama.
 
 ## basics
 regular transformer:
