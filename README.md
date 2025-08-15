@@ -1,5 +1,6 @@
 # Relaxed Recursive Transformers
 Implementation of [RRT-LoRA](https://arxiv.org/abs/2410.20672) by Google DeepMind on TinyLlama.
+<img width="1040" height="326" alt="Screenshot 2025-08-15 at 3 28 04 AM" src="https://github.com/user-attachments/assets/aa099b32-4e25-4a9c-bdf0-4b0c8f4bd60f" />
 
 ## basics
 regular transformer:
