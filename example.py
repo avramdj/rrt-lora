@@ -271,7 +271,7 @@ def train_model(
     tokenizer: Any,
     num_epochs: int = 25,
     batch_size: int = 4,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 5e-5,
     load_checkpoint_if_exists: bool = False,
     save_every: int = 500,
     sample_every: int = 500,
