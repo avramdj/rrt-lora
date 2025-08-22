@@ -174,7 +174,7 @@ def load_model_and_tokenizer(
 
     print("Compiling model...")
     begin = time()
-    model = compile(model, fullgraph=False, mode="default")
+    model = compile(model, fullgraph=False, mode="max-autotune-no-cudagraphs")
     end = time()
     print(f"Model compiled in {end - begin:.2f} seconds")
 
@@ -227,10 +227,34 @@ def generate_sample(
     model.eval()
     with torch.no_grad():
         tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        generated = model.generate(tokens, max_new_tokens=20, temperature=0.7, top_k=50)
+        use_cuda_amp = device.type == "cuda"
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=use_cuda_amp
+        ):
+            generated = model.generate(
+                tokens, max_new_tokens=64, temperature=0.7, top_k=50
+            )
         response = tokenizer.decode(generated[0], skip_special_tokens=True)
     model.train()
     return response
+
+
+def generate_samples(
+    model: RecursiveTinyLlama, tokenizer: Any, device: torch.device
+) -> list[tuple[str, str]]:
+    """Generate multiple sample prompts and completions."""
+    sample_prompts: list[str] = [
+        "The capital of France is Paris, and the capital of Germany is",
+        "Write a Python function that reverses a string:",
+        "Translate to French: 'How are you today?'",
+        "Summarize in one sentence: Large Language Models are changing software development by",
+        "Continue this story: Once upon a time, in a quiet village,",
+    ]
+    results: list[tuple[str, str]] = []
+    for prompt in sample_prompts:
+        completion = generate_sample(model, tokenizer, device, prompt)
+        results.append((prompt, completion))
+    return results
 
 
 class TextDataset(Dataset):
@@ -271,10 +295,10 @@ def train_model(
     tokenizer: Any,
     num_epochs: int = 25,
     batch_size: int = 4,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 3e-4,
     load_checkpoint_if_exists: bool = False,
     save_every: int = 500,
-    sample_every: int = 500,
+    sample_every: int = 100,
     grad_accumulation_steps: int = 8,
 ) -> None:
     """Train the model on wikitext data"""
@@ -322,15 +346,34 @@ def train_model(
                 "lr": learning_rate,
             },
             {
+                "params": [p for n, p in model.named_parameters() if "lm_head" in n],
+                "lr": learning_rate / 4,
+            },
+            {
                 "params": [
                     p
                     for n, p in model.named_parameters()
-                    if "weight" in n and "lora" not in n
+                    if ("weight" in n and "lora" not in n and "lm_head" not in n)
                 ],
                 "lr": learning_rate / 4,
             },
         ]
     )
+
+    # Scheduler: 500-step warmup then linear decay to 0
+    steps_per_epoch = max(1, len(dataloader) // grad_accumulation_steps)
+    total_steps = max(1, num_epochs * steps_per_epoch)
+    warmup_steps = 500
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return max(0.0, 1.0 - progress)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     start_epoch = 0
     global_step = 0
@@ -339,17 +382,23 @@ def train_model(
     if load_checkpoint_if_exists:
         global_step, best_loss = load_checkpoint(model, optimizer)
 
-    test_prompt = "The capital of France is Paris, and the capital of Germany is"
     optimizer.zero_grad()
+    progress_bar = tqdm(total=total_steps, initial=global_step, desc="Training (steps)")
+    finished = False
     for epoch in range(start_epoch, num_epochs):
+        if finished:
+            break
         model.train()
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
         accumulated_loss = 0.0
-        for i, batch in enumerate(progress_bar):
+        for i, batch in enumerate(dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # Forward pass
-            logits = model(batch["input_ids"])
+            use_cuda_amp = device.type == "cuda"
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=use_cuda_amp
+            ):
+                logits = model(batch["input_ids"])
 
             # Calculate loss
             loss = F.cross_entropy(
@@ -368,30 +417,49 @@ def train_model(
                 optimizer.zero_grad()
                 loss_value = accumulated_loss
                 accumulated_loss = 0.0
+
+                # Step LR scheduler AFTER optimizer step
+                scheduler.step()
+
+                # Increment global step and update progress bar
+                global_step += 1
+                progress_bar.update(1)
+
                 # Log metrics
+                current_lr = optimizer.param_groups[0]["lr"]
                 wandb.log(
                     {
                         "loss": loss_value,
                         "perplexity": math.exp(loss_value),
                         "epoch": epoch,
                         "global_step": global_step,
+                        "lr": current_lr,
                     }
                 )
+                progress_bar.set_postfix(
+                    {"loss": f"{loss_value:.4f}", "lr": f"{current_lr:.2e}"}
+                )
 
-                progress_bar.set_postfix({"loss": f"{loss_value:.4f}"})
-
-                # Generate sample periodically
+                # Generate multiple samples periodically
                 if global_step > 0 and global_step % sample_every == 0:
-                    sample = generate_sample(model, tokenizer, device, test_prompt)
+                    samples = generate_samples(model, tokenizer, device)
                     print(f"\nStep {global_step}, Loss {loss_value:.4f}")
-                    print(f"Sample: {sample}\n")
-                    wandb.log({"sample_text": sample, "step": global_step})
+                    for idx, (prompt_text, completion) in enumerate(samples):
+                        print(f"Prompt {idx + 1}: {prompt_text}")
+                        print(f"Completion {idx + 1}: {completion}\n")
+                    samples_table = wandb.Table(columns=["idx", "prompt", "output"])
+                    for idx, (p, o) in enumerate(samples):
+                        samples_table.add_data(idx, p, o)
+                    wandb.log({"samples_table": samples_table, "step": global_step})
 
                 # Save checkpoint periodically
                 if global_step > 0 and global_step % save_every == 0:
                     save_checkpoint(model, optimizer, global_step, loss_value)
 
-                global_step += 1
+                # Stop if we have reached total steps
+                if global_step >= total_steps:
+                    finished = True
+                    break
 
 
 def main() -> None:
