@@ -1,4 +1,5 @@
 import math
+from collections import defaultdict
 from typing import Optional
 
 import torch
@@ -60,7 +61,8 @@ class Attention(nn.Module):
         num_key_value_heads: int,
         shared_weights: Optional["SharedWeights"] = None,
         lora_rank: int = 0,
-        init_weights: Optional[dict] = None,
+        init_lora_weights: Optional[dict] = None,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -77,34 +79,50 @@ class Attention(nn.Module):
             self.wq = RecursiveLinear(
                 dim,
                 dim,
-                False,
-                shared_weights.get_weight("attn_q"),
-                lora_rank,
-                init_weights.get("q") if init_weights else None,
+                bias=False,
+                shared_weight=shared_weights.get_weight(
+                    "self_attn", "q_proj", layer_idx
+                ),
+                lora_rank=lora_rank,
+                init_lora_weights=init_lora_weights["q_proj"]
+                if init_lora_weights
+                else None,
             )
             self.wk = RecursiveLinear(
                 dim,
                 dim // 8,
-                False,
-                shared_weights.get_weight("attn_k"),
-                lora_rank,
-                init_weights.get("k") if init_weights else None,
+                bias=False,
+                shared_weight=shared_weights.get_weight(
+                    "self_attn", "k_proj", layer_idx
+                ),
+                lora_rank=lora_rank,
+                init_lora_weights=init_lora_weights["k_proj"]
+                if init_lora_weights
+                else None,
             )
             self.wv = RecursiveLinear(
                 dim,
                 dim // 8,
-                False,
-                shared_weights.get_weight("attn_v"),
-                lora_rank,
-                init_weights.get("v") if init_weights else None,
+                bias=False,
+                shared_weight=shared_weights.get_weight(
+                    "self_attn", "v_proj", layer_idx
+                ),
+                lora_rank=lora_rank,
+                init_lora_weights=init_lora_weights["v_proj"]
+                if init_lora_weights
+                else None,
             )
             self.wo = RecursiveLinear(
                 dim,
                 dim,
-                False,
-                shared_weights.get_weight("attn_o"),
-                lora_rank,
-                init_weights.get("o") if init_weights else None,
+                bias=False,
+                shared_weight=shared_weights.get_weight(
+                    "self_attn", "o_proj", layer_idx
+                ),
+                lora_rank=lora_rank,
+                init_lora_weights=init_lora_weights["o_proj"]
+                if init_lora_weights
+                else None,
             )
         else:
             self.wq = nn.Linear(dim, dim, bias=False)
@@ -127,28 +145,21 @@ class Attention(nn.Module):
 
         q, k = self.rope(q, k, T)
 
-        # return F.scaled_dot_product_attention(
-        #     q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=True, enable_gqa=True
-        # )
-
         if self.num_key_value_heads != self.n_heads:
             k = k.repeat_interleave(self.n_heads // self.num_key_value_heads, dim=1)
             v = v.repeat_interleave(self.n_heads // self.num_key_value_heads, dim=1)
 
-        if mask is None:
-            causal_mask = torch.triu(
-                torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
+        if mask is not None:
+            mask = mask.to(dtype=q.dtype)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
             )
-            mask = torch.zeros(B, 1, T, T, dtype=x.dtype, device=x.device)
-            mask.masked_fill_(causal_mask, float("-inf"))
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+            )
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = (q @ k.transpose(-2, -1)) * scale
-
-        scores = scores + mask
-
-        attention = F.softmax(scores, dim=-1)
-        out = (attention @ v).transpose(1, 2).contiguous()
+        out = out.transpose(1, 2).contiguous()
         out = out.view(B, T, C)
 
         return self.wo(out)
@@ -163,11 +174,43 @@ ACT2FN = {
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, hidden_act: str):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        hidden_act: str,
+        shared_weights: Optional["SharedWeights"] = None,
+        init_lora_weights: Optional[dict] = None,
+        layer_idx: int = 0,
+    ):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate_proj = RecursiveLinear(
+            dim,
+            hidden_dim,
+            bias=False,
+            shared_weight=shared_weights.get_weight("mlp", "gate_proj", layer_idx),
+            init_lora_weights=init_lora_weights["gate_proj"]
+            if init_lora_weights
+            else None,
+        )
+        self.down_proj = RecursiveLinear(
+            hidden_dim,
+            dim,
+            bias=False,
+            shared_weight=shared_weights.get_weight("mlp", "down_proj", layer_idx),
+            init_lora_weights=init_lora_weights["down_proj"]
+            if init_lora_weights
+            else None,
+        )
+        self.up_proj = RecursiveLinear(
+            dim,
+            hidden_dim,
+            bias=False,
+            shared_weight=shared_weights.get_weight("mlp", "up_proj", layer_idx),
+            init_lora_weights=init_lora_weights["up_proj"]
+            if init_lora_weights
+            else None,
+        )
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -184,16 +227,37 @@ class RecursiveTransformerBlock(nn.Module):
         num_key_value_heads: int,
         shared_weights: Optional["SharedWeights"] = None,
         lora_rank: int = 0,
+        init_lora_weights: Optional[dict] = None,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.attention = Attention(
-            dim, n_heads, num_key_value_heads, shared_weights, lora_rank
+            dim,
+            n_heads,
+            num_key_value_heads=num_key_value_heads,
+            shared_weights=shared_weights,
+            lora_rank=lora_rank,
+            init_lora_weights=init_lora_weights[layer_idx]["self_attn"]
+            if init_lora_weights
+            else None,
+            layer_idx=layer_idx,
         )
-        self.feed_forward = FeedForward(dim, intermediate_size, hidden_act)
+        self.feed_forward = FeedForward(
+            dim,
+            intermediate_size,
+            hidden_act,
+            shared_weights=shared_weights,
+            init_lora_weights=init_lora_weights[layer_idx]["mlp"]
+            if init_lora_weights
+            else None,
+            layer_idx=layer_idx,
+        )
         self.attention_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, layer_idx: int = 0
+    ):
         x = x + self.attention(self.attention_norm(x), mask)
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
@@ -205,19 +269,15 @@ class LoRALayer(nn.Module):
         in_dim: int,
         out_dim: int,
         rank: int,
-        init_weights: Optional[torch.Tensor] = None,
+        init_lora_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.rank = rank
 
-        if init_weights is not None and rank > 0:
-            # Initialize using truncated SVD of the residual as per paper
-            U, S, Vh = torch.linalg.svd(init_weights)
-            # Take only top-r singular values/vectors
-            self.B = nn.Parameter(U[:, :rank] @ torch.diag(S[:rank]))  # out_dim x rank
-            self.A = nn.Parameter(Vh[:rank, :])  # rank x in_dim
+        if init_lora_weights is not None and rank > 0:
+            self.B = nn.Parameter(init_lora_weights["B"])
+            self.A = nn.Parameter(init_lora_weights["A"])
         else:
-            # Random initialization if no init weights provided
             self.B = nn.Parameter(torch.randn(out_dim, rank) / math.sqrt(rank))
             self.A = nn.Parameter(torch.randn(rank, in_dim) / math.sqrt(rank))
 
@@ -239,7 +299,7 @@ class RecursiveLinear(nn.Module):
         bias: bool,
         shared_weight: Optional[nn.Parameter] = None,
         lora_rank: int = 0,
-        init_weights: Optional[torch.Tensor] = None,
+        init_lora_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -253,29 +313,53 @@ class RecursiveLinear(nn.Module):
         else:
             self.weight = shared_weight
 
-        self.lora = LoRALayer(in_features, out_features, lora_rank, init_weights)
+        self.lora = LoRALayer(
+            in_features,
+            out_features,
+            lora_rank,
+            init_lora_weights if init_lora_weights else None,
+        )
 
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # W'x + BAx as (W' + BA)x
-        # return F.linear(x, self.weight) + self.lora(x)
         return F.linear(x, self.weight + self.lora.get_weight())
 
 
 class SharedWeights:
     """Manages shared weights between recursive blocks"""
 
-    def __init__(self, shapes: dict):
-        self.shared_weights = {
-            name: nn.Parameter(torch.empty(shape)) for name, shape in shapes.items()
-        }
-        # Initialize all shared weights
-        for weight in self.shared_weights.values():
-            torch.nn.init.normal_(weight, mean=0.0, std=0.02)
+    def __init__(
+        self,
+        b_layers: int,
+        original_num_layers: int,
+        backbone_weights: Optional[dict] = None,
+        shapes: Optional[dict] = None,
+    ):
+        self.b_layers = b_layers
+        self.original_num_layers = original_num_layers
 
-    def get_weight(self, name: str) -> nn.Parameter:
-        return self.shared_weights[name]
+        if backbone_weights is not None:
+            self.shared_weights = []
+            for layer in backbone_weights:
+                block_p = defaultdict(dict)
+                for block_type, projs in layer.items():
+                    for proj_type, proj_weight in projs.items():
+                        block_p[block_type][proj_type] = nn.Parameter(proj_weight)
+                self.shared_weights.append(block_p)
+        else:
+            self.shared_weights = []
+            for layer in range(b_layers):
+                layer_p = []
+                for block in shapes:
+                    block_p = []
+                    for proj_shape in block:
+                        block_p.append(nn.Parameter(torch.zeros(proj_shape)))
+                    layer_p.append(block_p)
+                self.shared_weights.append(layer_p)
+
+    def get_weight(self, block_type: str, name: str, idx_l: int) -> nn.Parameter:
+        return self.shared_weights[idx_l % self.b_layers][block_type][name]
 
 
 class RecursiveTinyLlama(nn.Module):
@@ -290,21 +374,28 @@ class RecursiveTinyLlama(nn.Module):
         num_key_value_heads: int,
         num_blocks: int,  # B in the paper
         lora_rank: int = 4,  # Add LoRA rank parameter
+        init_lora_weights: Optional[dict] = None,
+        backbone_weights: Optional[dict] = None,
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, dim)
 
         # Initialize shared weights
         shared_weights = SharedWeights(
-            {
-                "attn_q": (dim, dim),
-                "attn_k": (dim // 8, dim),
-                "attn_v": (dim // 8, dim),
-                "attn_o": (dim, dim),
-                "ffn_gate": (intermediate_size, dim),
-                "ffn_up": (intermediate_size, dim),
-                "ffn_down": (dim, intermediate_size),
-            }
+            b_layers=num_blocks,
+            original_num_layers=n_layers,
+            backbone_weights=backbone_weights,
+            shapes={
+                "self_attn": {
+                    "q_proj": (dim, dim),
+                    "k_proj": (dim // 8, dim),
+                    "v_proj": (dim // 8, dim),
+                    "o_proj": (dim, dim),
+                },
+                "gate_proj": (intermediate_size, dim),
+                "up_proj": (intermediate_size, dim),
+                "down_proj": (dim, intermediate_size),
+            },
         )
 
         # Create B blocks with shared weights
@@ -318,8 +409,10 @@ class RecursiveTinyLlama(nn.Module):
                     num_key_value_heads=num_key_value_heads,
                     shared_weights=shared_weights,
                     lora_rank=lora_rank,
+                    init_lora_weights=init_lora_weights,
+                    layer_idx=layer_idx,
                 )
-                for _ in range(num_blocks)
+                for layer_idx in range(n_layers)
             ]
         )
 
@@ -331,16 +424,41 @@ class RecursiveTinyLlama(nn.Module):
     def forward(self, tokens: torch.Tensor, mask: Optional[torch.Tensor] = None):
         x = self.token_embedding(tokens)
 
-        # Apply layers recursively using blocks
-        for layer_idx in range(self.n_layers):
-            # Fix the block index calculation
-            block_idx = (
-                layer_idx % self.num_blocks
-            )  # Simplified formula since we're 0-based
-            x = self.blocks[block_idx](x, mask)
+        for idx, block in enumerate(self.blocks):
+            x = block(x, mask)
 
         x = self.norm(x)
         return self.lm_head(x)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.token_embedding
+
+    def set_input_embeddings(self, new_embeddings: nn.Embedding) -> None:
+        if (
+            new_embeddings.embedding_dim != self.token_embedding.embedding_dim
+            or new_embeddings.num_embeddings != self.token_embedding.num_embeddings
+        ):
+            raise ValueError(
+                "new_embeddings shape does not match current token embedding"
+            )
+        self.token_embedding = new_embeddings
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+    def set_output_embeddings(self, new_output: nn.Linear) -> None:
+        if (
+            new_output.in_features != self.lm_head.in_features
+            or new_output.out_features != self.lm_head.out_features
+        ):
+            raise ValueError("new_output shape does not match current lm_head")
+        self.lm_head = new_output
+
+    def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.token_embedding(input_ids)
+
+    def project_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states)
 
     @torch.no_grad()
     def generate(

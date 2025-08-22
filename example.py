@@ -1,4 +1,5 @@
 import argparse
+import gc
 import math
 import os
 from time import time
@@ -7,6 +8,7 @@ from typing import Any, Callable, Optional, TypeVar
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -39,8 +41,92 @@ def compile(
     return model
 
 
+def calculate_backbone_and_lora_inits(
+    hf_model: nn.Module,
+    num_layers: int,
+    num_blocks: int,
+    lora_rank: int,
+) -> tuple[
+    list[dict[str, dict[str, torch.Tensor]]], dict[str, list[dict[str, torch.Tensor]]]
+]:
+    original_weights = {
+        "self_attn": {"q_proj": [], "k_proj": [], "v_proj": [], "o_proj": []},
+        "mlp": {"gate_proj": [], "up_proj": [], "down_proj": []},
+    }
+    for name, param in hf_model.named_parameters():
+        if name.startswith("model.layers"):
+            parts = name.split(".")
+            try:
+                layer_idx, block_type, proj_type = int(parts[2]), parts[3], parts[4]
+                while len(original_weights[block_type][proj_type]) <= layer_idx:
+                    original_weights[block_type][proj_type].append(None)
+                original_weights[block_type][proj_type][layer_idx] = param.data.clone()
+            except (KeyError, IndexError):
+                continue
+
+    backbone_weights = [
+        {
+            "self_attn": {
+                "q_proj": None,
+                "k_proj": None,
+                "v_proj": None,
+                "o_proj": None,
+            },
+            "mlp": {"gate_proj": None, "up_proj": None, "down_proj": None},
+        }
+        for _ in range(num_blocks)
+    ]
+
+    for k in range(num_blocks):
+        for block_type, projs in original_weights.items():
+            for proj_type, W_l_list in projs.items():
+                grouped_layers = [
+                    W_l_list[layer_idx]
+                    for layer_idx in range(k, num_layers, num_blocks)
+                ]
+                avg_weight = torch.stack(grouped_layers, dim=0).mean(dim=0)
+                backbone_weights[k][block_type][proj_type] = avg_weight
+
+    lora_initial_weights = [
+        {
+            "self_attn": {
+                "q_proj": None,
+                "k_proj": None,
+                "v_proj": None,
+                "o_proj": None,
+            },
+            "mlp": {"gate_proj": None, "up_proj": None, "down_proj": None},
+        }
+        for _ in range(num_layers)
+    ]
+
+    if lora_rank > 0:
+        for layer_idx in range(num_layers):
+            k = layer_idx % num_blocks
+            for block_type, projs in original_weights.items():
+                for proj_type, W_l_list in projs.items():
+                    W_l = W_l_list[layer_idx]
+                    W_k_prime = backbone_weights[k][block_type][proj_type]
+                    residual = W_l - W_k_prime
+
+                    U, S, Vh = torch.linalg.svd(residual, full_matrices=False)
+                    U_r, S_r, Vh_r = U[:, :lora_rank], S[:lora_rank], Vh[:lora_rank, :]
+
+                    B = U_r @ torch.diag(S_r)
+                    A = Vh_r
+
+                    lora_initial_weights[layer_idx][block_type][proj_type] = {
+                        "A": A,
+                        "B": B,
+                    }
+
+    return backbone_weights, lora_initial_weights
+
+
 def load_model_and_tokenizer(
     lora_rank: int,
+    num_blocks: int,
+    store_original: bool = False,
 ) -> tuple[
     Optional[RecursiveTinyLlama], Optional[Any], Optional[dict[str, torch.Tensor]]
 ]:
@@ -50,7 +136,7 @@ def load_model_and_tokenizer(
     hf_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name).to(device)
-    print(hf_model.model)
+    # print(hf_model.model)
     ORIGINAL_PARAMS = sum(p.numel() for p in hf_model.parameters())
     print(f"Original parameters: {ORIGINAL_PARAMS:,}")
 
@@ -62,6 +148,12 @@ def load_model_and_tokenizer(
     print(f"Full rank: {full_rank}")
     print(f"LoRA rank: {lora_rank}")
 
+    print("Calculating backbone and LoRA initial weights...")
+    backbone_weights, lora_initial_weights = calculate_backbone_and_lora_inits(
+        hf_model, config.num_hidden_layers, num_blocks, lora_rank
+    )
+    print("Backbone and LoRA initial weights calculated")
+
     model = RecursiveTinyLlama(
         vocab_size=config.vocab_size,
         dim=config.hidden_size,
@@ -70,9 +162,15 @@ def load_model_and_tokenizer(
         intermediate_size=config.intermediate_size,
         hidden_act=config.hidden_act,
         num_key_value_heads=config.num_key_value_heads,
-        num_blocks=4,
+        num_blocks=num_blocks,
         lora_rank=lora_rank,
+        init_lora_weights=lora_initial_weights,
+        backbone_weights=backbone_weights,
     ).to(device)
+
+    with torch.no_grad():
+        model.get_input_embeddings().weight.copy_(hf_model.model.embed_tokens.weight)
+        model.get_output_embeddings().weight.copy_(hf_model.lm_head.weight)
 
     print("Compiling model...")
     begin = time()
@@ -80,35 +178,13 @@ def load_model_and_tokenizer(
     end = time()
     print(f"Model compiled in {end - begin:.2f} seconds")
 
-    # Store original weights with better keys
-    original_weights: dict[str, torch.Tensor] = {}
+    original_weights: Optional[dict[str, torch.Tensor]] = {} if store_original else None
 
-    def copy_weights(
-        m1: torch.nn.Module, m2: torch.nn.Module, layer_idx: int, weight_type: str
-    ) -> bool:
-        with torch.no_grad():
-            if m1.weight.shape != m2.weight.shape:
-                print(f"Shape mismatch: {m1.weight.shape} vs {m2.weight.shape}")
-                return False
-            key = f"layer_{layer_idx}_{weight_type}"
-            original_weights[key] = m2.weight.clone()
-            m1.weight.copy_(m2.weight)
-            return True
-
-    # Copy transformer layers with proper indexing
-    for block_idx, block in enumerate(model.blocks):
-        # Copy weights from corresponding HF layer
-        l2 = hf_model.model.layers[block_idx]
-        if not all(
-            [
-                copy_weights(block.attention.wq, l2.self_attn.q_proj, block_idx, "q"),
-                copy_weights(block.attention.wk, l2.self_attn.k_proj, block_idx, "k"),
-                copy_weights(block.attention.wv, l2.self_attn.v_proj, block_idx, "v"),
-                copy_weights(block.attention.wo, l2.self_attn.o_proj, block_idx, "o"),
-            ]
-        ):
-            print(f"Error in attention weight copying for block {block_idx}")
-            return None, None, None
+    del config
+    del hf_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print("Model loaded successfully!")
     return model, hf_tokenizer, original_weights
@@ -337,13 +413,22 @@ def main() -> None:
         default=8,
         help="Gradient accumulation steps",
     )
+    parser.add_argument(
+        "-b",
+        "--num-blocks",
+        type=int,
+        help="Number of blocks",
+        default=2,
+    )
     args = parser.parse_args()
 
     device = get_device()
     print(f"Using device: {device}")
 
     # Load models
-    model, tokenizer, _ = load_model_and_tokenizer(lora_rank=args.rank)
+    model, tokenizer, _ = load_model_and_tokenizer(
+        lora_rank=args.rank, num_blocks=args.num_blocks
+    )
     if model is None or tokenizer is None:
         print("Failed to load model properly")
         return
