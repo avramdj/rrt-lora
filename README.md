@@ -1,5 +1,6 @@
 # Relaxed Recursive Transformers
-https://arxiv.org/abs/2410.20672
+Implementation of [RRT-LoRA](https://arxiv.org/abs/2410.20672) by Google DeepMind on TinyLlama.
+<img width="1040" height="326" alt="Screenshot 2025-08-15 at 3 28 04 AM" src="https://github.com/user-attachments/assets/aa099b32-4e25-4a9c-bdf0-4b0c8f4bd60f" />
 
 ## basics
 regular transformer:
@@ -41,7 +42,3 @@ so the final learned mapping approximates:
 
 $W^l \approx W^\prime_{((l-1) \bmod L/B + 1)} + B^lA^l$
 
-## control with rank r
-- $r = 0$: pure recursive ($W^l \approx W^\prime$)
-- small $r$: mostly shared with slight adjustments
-- full $r$: can recover original ($W^l = W^\prime + BA$)
