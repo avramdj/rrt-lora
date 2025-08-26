@@ -42,3 +42,27 @@ so the final learned mapping approximates:
 
 $W^l \approx W^\prime_{((l-1) \bmod L/B + 1)} + B^lA^l$
 
+## References
+
+```bibtex
+@inproceedings{Bae2025Relaxed,
+    title={Relaxed Recursive Transformers: Effective Parameter Sharing with Layer-wise LoRA},
+    author={Sangmin Bae and Adam Fisch and Hrayr Harutyunyan and Ziwei Ji and Seungyeon Kim and Tal Schuster},
+    booktitle={International Conference on Learning Representations},
+    year={2025}
+}
+```
+
+## How to Cite
+If you use this implementation in your research, please cite it as follows:
+
+```bibtex
+@software{avram_rrt_lora_2024,
+  author = {Your Name or Username},
+  title = {rrt-lora: An Implementation of Relaxed Recursive Transformers},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  url = {https://github.com/avramdj/rrt-lora}
+}
+```
