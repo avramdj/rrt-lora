@@ -61,8 +61,6 @@ If you use this implementation in your research, please cite it as follows:
   author = {Avram Djordjevic},
   title = {rrt-lora: An Implementation of Relaxed Recursive Transformers},
   year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
   url = {https://github.com/avramdj/rrt-lora}
 }
 ```
