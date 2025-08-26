@@ -58,7 +58,7 @@ If you use this implementation in your research, please cite it as follows:
 
 ```bibtex
 @software{avram_rrt_lora_2024,
-  author = {Your Name or Username},
+  author = {Avram Djordjevic},
   title = {rrt-lora: An Implementation of Relaxed Recursive Transformers},
   year = {2024},
   publisher = {GitHub},
